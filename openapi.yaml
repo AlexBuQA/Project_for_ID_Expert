@@ -1,0 +1,893 @@
+openapi: 3.0.3
+info:
+  title: Telematics Platform API
+  description: >
+    Единый REST API универсальной платформы Телематики для разнородного парка техники
+    (тракторы, вилочные погрузчики, тележки, роботы/ВАТС).
+    API покрывает две группы операций: приём телеметрии от устройств (ingestion)
+    и выдачу данных потребителям (query/management).
+    Разработчик спецификации: Бужор Александра. Заказчик: «ID Expert» (Априорные решения машин).
+  version: "1.0.0"
+  contact:
+    name: Аналитика проекта
+    email: analytics@id-expert.example
+servers:
+  - url: https://api.telematics.example/api/v1
+    description: Production
+  - url: https://staging-api.telematics.example/api/v1
+    description: Staging
+
+tags:
+  - name: Ingestion
+    description: Приём телеметрии и событий от бортовых устройств (device → platform)
+  - name: Vehicles
+    description: Реестр транспортных средств
+  - name: Metrics
+    description: Выдача временных рядов телеметрии
+  - name: Fleet
+    description: Текущее состояние парка (для карты мониторинга)
+  - name: Events
+    description: События и нарушения
+  - name: Missions
+    description: Миссии для ВАТС
+  - name: Geofences
+    description: Геозоны
+  - name: AlertRules
+    description: Правила детекции и оповещений
+  - name: Reports
+    description: Отчёты и аналитика
+  - name: Catalogs
+    description: Справочники (типы ТС, датчиков, событий)
+
+security:
+  - bearerAuth: []
+
+paths:
+
+  # ---------------- INGESTION ----------------
+  /ingest/telemetry:
+    post:
+      tags: [Ingestion]
+      summary: Приём пакета телеметрии от устройства
+      description: >
+        Устройство отправляет батч измерений. Одна точка = значение одного датчика в момент времени.
+        Метки времени формируются на устройстве; при офлайне данные буферизуются и досылаются
+        с исходными ts. Дедупликация выполняется по (vehicle_id, sensor, ts).
+      operationId: ingestTelemetry
+      security:
+        - deviceAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TelemetryBatch'
+            examples:
+              mixed:
+                $ref: '#/components/examples/TelemetryBatchExample'
+      responses:
+        '202':
+          description: Батч принят в обработку
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IngestAck'
+        '207':
+          description: Частично принято (часть точек отклонена валидацией)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IngestPartial'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /ingest/events:
+    post:
+      tags: [Ingestion]
+      summary: Приём событий, детектированных на устройстве
+      operationId: ingestEvents
+      security:
+        - deviceAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [vehicle_id, events]
+              properties:
+                vehicle_id: { type: string, example: "FRK-014" }
+                events:
+                  type: array
+                  items: { $ref: '#/components/schemas/EventInput' }
+      responses:
+        '202': { description: Принято }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # ---------------- VEHICLES ----------------
+  /vehicles:
+    get:
+      tags: [Vehicles]
+      summary: Список ТС с фильтрацией и пагинацией
+      operationId: listVehicles
+      parameters:
+        - { name: type, in: query, schema: { type: string }, description: Код типа ТС }
+        - { name: powertrain, in: query, schema: { type: string, enum: [ice, ev, hybrid, none] } }
+        - { name: status, in: query, schema: { type: string, enum: [active, idle, offline, maintenance, decommissioned] } }
+        - { name: site, in: query, schema: { type: string }, description: Площадка }
+        - { name: q, in: query, schema: { type: string }, description: Поиск по номеру/модели/ID }
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Vehicle' }
+                  pagination: { $ref: '#/components/schemas/Pagination' }
+    post:
+      tags: [Vehicles]
+      summary: Регистрация нового ТС
+      operationId: createVehicle
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/VehicleInput' }
+      responses:
+        '201':
+          description: Создано
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Vehicle' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /vehicles/{vehicleId}:
+    parameters:
+      - $ref: '#/components/parameters/VehicleId'
+    get:
+      tags: [Vehicles]
+      summary: Карточка ТС
+      operationId: getVehicle
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Vehicle' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Vehicles]
+      summary: Частичное обновление ТС
+      operationId: updateVehicle
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/VehicleInput' }
+      responses:
+        '200':
+          description: Обновлено
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Vehicle' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ---------------- METRICS ----------------
+  /vehicles/{vehicleId}/metrics:
+    parameters:
+      - $ref: '#/components/parameters/VehicleId'
+    get:
+      tags: [Metrics]
+      summary: Временной ряд телеметрии по ТС
+      description: >
+        Возвращает измерения выбранных датчиков за период. Поддерживает агрегацию
+        (downsampling) для длинных интервалов.
+      operationId: getVehicleMetrics
+      parameters:
+        - name: sensors
+          in: query
+          description: Список кодов датчиков через запятую (напр. battery.soc,battery.temp)
+          schema: { type: string }
+        - { name: from, in: query, required: true, schema: { type: string, format: date-time } }
+        - { name: to, in: query, required: true, schema: { type: string, format: date-time } }
+        - name: agg
+          in: query
+          description: Функция агрегации при downsampling
+          schema: { type: string, enum: [raw, avg, min, max, sum, last], default: raw }
+        - name: interval
+          in: query
+          description: Шаг агрегации (ISO 8601 duration, напр. PT1M, PT1H)
+          schema: { type: string, example: PT1M }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MetricSeries' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /vehicles/{vehicleId}/metrics/latest:
+    parameters:
+      - $ref: '#/components/parameters/VehicleId'
+    get:
+      tags: [Metrics]
+      summary: Последние значения всех датчиков ТС
+      operationId: getLatestMetrics
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  vehicle_id: { type: string }
+                  as_of: { type: string, format: date-time }
+                  values:
+                    type: array
+                    items: { $ref: '#/components/schemas/MetricPoint' }
+
+  # ---------------- FLEET STATE ----------------
+  /fleet/state:
+    get:
+      tags: [Fleet]
+      summary: Текущее состояние всего парка (для карты)
+      description: >
+        Денормализованный снимок последнего известного состояния каждого ТС
+        (позиция, статус, ключевые метрики). Оптимизирован под 1000+ ТС.
+      operationId: getFleetState
+      parameters:
+        - { name: bbox, in: query, description: "Геобокс minLon,minLat,maxLon,maxLat", schema: { type: string } }
+        - { name: status, in: query, schema: { type: string } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  as_of: { type: string, format: date-time }
+                  vehicles:
+                    type: array
+                    items: { $ref: '#/components/schemas/FleetVehicleState' }
+
+  # ---------------- EVENTS ----------------
+  /events:
+    get:
+      tags: [Events]
+      summary: Реестр событий/нарушений
+      operationId: listEvents
+      parameters:
+        - { name: vehicle_id, in: query, schema: { type: string } }
+        - { name: type, in: query, schema: { type: string }, description: Код типа события }
+        - { name: severity, in: query, schema: { type: string, enum: [info, warning, critical] } }
+        - { name: acknowledged, in: query, schema: { type: boolean } }
+        - { name: from, in: query, schema: { type: string, format: date-time } }
+        - { name: to, in: query, schema: { type: string, format: date-time } }
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Event' }
+                  pagination: { $ref: '#/components/schemas/Pagination' }
+
+  /events/{eventId}/ack:
+    parameters:
+      - { name: eventId, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      tags: [Events]
+      summary: Квитирование (подтверждение обработки) события
+      operationId: acknowledgeEvent
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                comment: { type: string }
+      responses:
+        '200':
+          description: Событие квитировано
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Event' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ---------------- MISSIONS ----------------
+  /missions:
+    get:
+      tags: [Missions]
+      summary: Список миссий ВАТС
+      operationId: listMissions
+      parameters:
+        - { name: vehicle_id, in: query, schema: { type: string } }
+        - { name: status, in: query, schema: { type: string, enum: [planned, active, paused, completed, aborted, failed] } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Mission' }
+    post:
+      tags: [Missions]
+      summary: Создать миссию для ВАТС
+      operationId: createMission
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MissionInput' }
+      responses:
+        '201':
+          description: Создано
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Mission' }
+
+  /missions/{missionId}:
+    parameters:
+      - { name: missionId, in: path, required: true, schema: { type: string, format: uuid } }
+    get:
+      tags: [Missions]
+      summary: Карточка миссии
+      operationId: getMission
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Mission' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Missions]
+      summary: Изменить статус/параметры миссии
+      operationId: updateMission
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                status: { type: string, enum: [planned, active, paused, completed, aborted, failed] }
+      responses:
+        '200':
+          description: Обновлено
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Mission' }
+
+  # ---------------- GEOFENCES ----------------
+  /geofences:
+    get:
+      tags: [Geofences]
+      summary: Список геозон
+      operationId: listGeofences
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Geofence' }
+    post:
+      tags: [Geofences]
+      summary: Создать геозону
+      operationId: createGeofence
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Geofence' }
+      responses:
+        '201': { description: Создано }
+
+  # ---------------- ALERT RULES ----------------
+  /alert-rules:
+    get:
+      tags: [AlertRules]
+      summary: Список правил алертов
+      operationId: listAlertRules
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/AlertRule' }
+    post:
+      tags: [AlertRules]
+      summary: Создать правило алерта
+      operationId: createAlertRule
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AlertRule' }
+      responses:
+        '201': { description: Создано }
+
+  # ---------------- REPORTS ----------------
+  /reports/fleet-efficiency:
+    get:
+      tags: [Reports]
+      summary: Отчёт по эффективности парка за период
+      operationId: getFleetEfficiencyReport
+      parameters:
+        - { name: from, in: query, required: true, schema: { type: string, format: date } }
+        - { name: to, in: query, required: true, schema: { type: string, format: date } }
+        - { name: group, in: query, schema: { type: string }, description: Группа/площадка ТС }
+        - { name: format, in: query, schema: { type: string, enum: [json, csv, xlsx, pdf], default: json } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FleetEfficiencyReport' }
+
+  # ---------------- CATALOGS ----------------
+  /catalogs/vehicle-types:
+    get:
+      tags: [Catalogs]
+      summary: Справочник типов ТС
+      operationId: listVehicleTypes
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/VehicleType' }
+  /catalogs/sensor-types:
+    get:
+      tags: [Catalogs]
+      summary: Справочник типов датчиков (каталог метрик)
+      operationId: listSensorTypes
+      parameters:
+        - { name: category, in: query, schema: { type: string, enum: [common, ice, ev, avts, specific] } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/SensorType' }
+  /catalogs/event-types:
+    get:
+      tags: [Catalogs]
+      summary: Справочник типов событий
+      operationId: listEventTypes
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/EventType' }
+
+components:
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Пользовательский доступ (OAuth2/JWT), RBAC по ролям.
+    deviceAuth:
+      type: apiKey
+      in: header
+      name: X-Device-Token
+      description: >
+        Идентификация бортового устройства. В production используется совместно с mutual TLS
+        (клиентский сертификат устройства).
+
+  parameters:
+    VehicleId:
+      name: vehicleId
+      in: path
+      required: true
+      description: Идентификатор ТС (external_id, напр. FRK-014)
+      schema: { type: string }
+    Page:
+      name: page
+      in: query
+      schema: { type: integer, minimum: 1, default: 1 }
+    PageSize:
+      name: page_size
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 500, default: 50 }
+
+  responses:
+    BadRequest:
+      description: Ошибка валидации запроса
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unauthorized:
+      description: Не авторизован
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: Не найдено
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Conflict:
+      description: Конфликт (напр. дубль external_id)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    RateLimited:
+      description: Превышен лимит запросов
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code: { type: string, example: VALIDATION_ERROR }
+        message: { type: string, example: "Поле 'from' обязательно" }
+        trace_id: { type: string, example: "b1f2c3d4" }
+        details:
+          type: array
+          items:
+            type: object
+            properties:
+              field: { type: string }
+              issue: { type: string }
+
+    Pagination:
+      type: object
+      properties:
+        page: { type: integer, example: 1 }
+        page_size: { type: integer, example: 50 }
+        total: { type: integer, example: 1248 }
+        total_pages: { type: integer, example: 25 }
+
+    VehicleType:
+      type: object
+      properties:
+        id: { type: integer }
+        code: { type: string, example: forklift_ev }
+        name: { type: string, example: "Погрузчик электрический" }
+        category: { type: string, enum: [tractor, forklift, cart, robot], example: forklift }
+        powertrain: { type: string, enum: [ice, ev, hybrid, none], example: ev }
+        is_autonomous: { type: boolean, example: false }
+        attributes: { type: object, additionalProperties: true }
+
+    VehicleInput:
+      type: object
+      required: [external_id, vehicle_type_code]
+      properties:
+        external_id: { type: string, example: FRK-014 }
+        vehicle_type_code: { type: string, example: forklift_ev }
+        model: { type: string, example: "Yale ERP035" }
+        serial_number: { type: string, example: "SN-88213" }
+        registration_number: { type: string, example: "—" }
+        status: { type: string, enum: [active, idle, offline, maintenance, decommissioned], default: active }
+        attributes:
+          type: object
+          additionalProperties: true
+          example: { site: "Склад 2", battery_capacity_kwh: 24, owner_dept: "Логистика" }
+
+    Vehicle:
+      allOf:
+        - $ref: '#/components/schemas/VehicleInput'
+        - type: object
+          properties:
+            id: { type: string, format: uuid }
+            vehicle_type: { $ref: '#/components/schemas/VehicleType' }
+            commissioned_at: { type: string, format: date-time }
+            created_at: { type: string, format: date-time }
+            updated_at: { type: string, format: date-time }
+
+    SensorType:
+      type: object
+      properties:
+        id: { type: integer }
+        code: { type: string, example: battery.temp }
+        name: { type: string, example: "Температура тяговой батареи" }
+        unit: { type: string, example: "°C" }
+        value_type: { type: string, enum: [numeric, boolean, text, json, geo], example: numeric }
+        min_value: { type: number, nullable: true, example: -40 }
+        max_value: { type: number, nullable: true, example: 120 }
+        category: { type: string, enum: [common, ice, ev, avts, specific], example: ev }
+
+    EventType:
+      type: object
+      properties:
+        id: { type: integer }
+        code: { type: string, example: overheat }
+        name: { type: string, example: "Перегрев" }
+        category: { type: string, example: technical }
+        default_severity: { type: string, enum: [info, warning, critical], example: critical }
+        description: { type: string }
+
+    # --- Ingestion ---
+    MetricInput:
+      type: object
+      required: [sensor, ts, value]
+      properties:
+        sensor: { type: string, example: battery.temp }
+        ts: { type: string, format: date-time, example: "2026-06-30T10:14:03Z" }
+        value:
+          description: Число, булево, строка или объект (для geo/json датчиков)
+          oneOf:
+            - { type: number }
+            - { type: boolean }
+            - { type: string }
+            - { type: object }
+          example: 61
+        unit: { type: string, nullable: true, example: "°C" }
+        q:
+          type: integer
+          description: "Качество: 1=валидно, 0=подозрительно, -1=ошибка датчика"
+          enum: [-1, 0, 1]
+          default: 1
+
+    TelemetryBatch:
+      type: object
+      required: [vehicle_id, sent_at, metrics]
+      properties:
+        vehicle_id: { type: string, example: FRK-014 }
+        device_id: { type: string, example: "TBU-000771" }
+        sent_at: { type: string, format: date-time, example: "2026-06-30T10:14:05Z" }
+        seq: { type: integer, description: Порядковый номер батча для контроля потерь, example: 84213 }
+        metrics:
+          type: array
+          items: { $ref: '#/components/schemas/MetricInput' }
+
+    IngestAck:
+      type: object
+      properties:
+        accepted: { type: integer, example: 12 }
+        batch_id: { type: string, format: uuid }
+
+    IngestPartial:
+      type: object
+      properties:
+        accepted: { type: integer, example: 10 }
+        rejected: { type: integer, example: 2 }
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              index: { type: integer }
+              reason: { type: string, example: "value out of range for battery.soc" }
+
+    EventInput:
+      type: object
+      required: [type, ts]
+      properties:
+        type: { type: string, example: overheat }
+        ts: { type: string, format: date-time }
+        severity: { type: string, enum: [info, warning, critical] }
+        geo:
+          type: object
+          properties:
+            lat: { type: number }
+            lon: { type: number }
+        payload:
+          type: object
+          additionalProperties: true
+          example: { value: 61, threshold: 55, sensor: "battery.temp" }
+
+    # --- Query ---
+    MetricPoint:
+      type: object
+      properties:
+        sensor: { type: string, example: battery.soc }
+        ts: { type: string, format: date-time }
+        value:
+          oneOf:
+            - { type: number }
+            - { type: boolean }
+            - { type: string }
+            - { type: object }
+        unit: { type: string, nullable: true }
+        quality: { type: integer }
+
+    MetricSeries:
+      type: object
+      properties:
+        vehicle_id: { type: string }
+        from: { type: string, format: date-time }
+        to: { type: string, format: date-time }
+        agg: { type: string }
+        interval: { type: string, nullable: true }
+        series:
+          type: array
+          items:
+            type: object
+            properties:
+              sensor: { type: string, example: battery.temp }
+              unit: { type: string, example: "°C" }
+              points:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    ts: { type: string, format: date-time }
+                    value: { type: number }
+
+    FleetVehicleState:
+      type: object
+      properties:
+        vehicle_id: { type: string, example: FRK-014 }
+        type: { type: string, example: forklift }
+        powertrain: { type: string, example: ev }
+        status: { type: string, enum: [active, idle, offline, maintenance, alarm] }
+        last_seen: { type: string, format: date-time }
+        position:
+          type: object
+          properties:
+            lat: { type: number, example: 55.751 }
+            lon: { type: number, example: 37.618 }
+            speed: { type: number, example: 0 }
+            heading: { type: number, example: 0 }
+        key_metrics:
+          type: object
+          additionalProperties: true
+          example: { "battery.soc": 47, "battery.temp": 61 }
+        active_alarms: { type: integer, example: 1 }
+
+    Event:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        ts: { type: string, format: date-time }
+        vehicle_id: { type: string }
+        type: { type: string, example: overheat }
+        severity: { type: string, enum: [info, warning, critical] }
+        geo:
+          type: object
+          properties:
+            lat: { type: number }
+            lon: { type: number }
+        payload: { type: object, additionalProperties: true }
+        acknowledged: { type: boolean }
+        ack_by: { type: string, nullable: true }
+        ack_at: { type: string, format: date-time, nullable: true }
+
+    MissionInput:
+      type: object
+      required: [vehicle_id, planned_route]
+      properties:
+        vehicle_id: { type: string, example: ROB-002 }
+        code: { type: string, example: M-88 }
+        planned_route:
+          type: array
+          items:
+            type: object
+            properties:
+              lat: { type: number }
+              lon: { type: number }
+              action: { type: string, example: pickup }
+        priority: { type: integer, default: 5 }
+
+    Mission:
+      allOf:
+        - $ref: '#/components/schemas/MissionInput'
+        - type: object
+          properties:
+            id: { type: string, format: uuid }
+            status: { type: string, enum: [planned, active, paused, completed, aborted, failed] }
+            progress_pct: { type: number, example: 63 }
+            started_at: { type: string, format: date-time, nullable: true }
+            finished_at: { type: string, format: date-time, nullable: true }
+            result: { type: object, additionalProperties: true }
+
+    Geofence:
+      type: object
+      required: [name, kind, geometry]
+      properties:
+        id: { type: string, format: uuid, readOnly: true }
+        name: { type: string, example: "Склад 2" }
+        kind: { type: string, enum: [inclusion, exclusion], example: inclusion }
+        geometry:
+          type: object
+          description: GeoJSON Polygon
+          properties:
+            type: { type: string, example: Polygon }
+            coordinates:
+              type: array
+              items:
+                type: array
+                items:
+                  type: array
+                  items: { type: number }
+        is_active: { type: boolean, default: true }
+
+    AlertRule:
+      type: object
+      required: [name, condition]
+      properties:
+        id: { type: string, format: uuid, readOnly: true }
+        name: { type: string, example: "Перегрев батареи EV" }
+        applies_to:
+          type: object
+          description: Фильтр применимости (тип ТС/площадка)
+          properties:
+            vehicle_type: { type: string, example: forklift_ev }
+        condition:
+          type: object
+          properties:
+            sensor: { type: string, example: battery.temp }
+            operator: { type: string, enum: [">", ">=", "<", "<=", "==", "!="], example: ">" }
+            threshold: { type: number, example: 55 }
+            for_seconds: { type: integer, example: 30 }
+        severity: { type: string, enum: [info, warning, critical], example: critical }
+        actions:
+          type: array
+          items: { type: string, enum: [email, push, webhook, sms] }
+          example: [push, email]
+        is_active: { type: boolean, default: true }
+
+    FleetEfficiencyReport:
+      type: object
+      properties:
+        period: { type: object, properties: { from: { type: string }, to: { type: string } } }
+        summary:
+          type: object
+          properties:
+            utilization_pct: { type: number, example: 72 }
+            availability_pct: { type: number, example: 94 }
+            fuel_liters: { type: number, example: 4820 }
+            energy_kwh: { type: number, example: 1340 }
+            downtime_hours: { type: number, example: 312 }
+        by_vehicle:
+          type: array
+          items:
+            type: object
+            properties:
+              vehicle_id: { type: string }
+              utilization_pct: { type: number }
+              engine_hours: { type: number }
+              specific_consumption: { type: number }
+              violations: { type: integer }
+
+  examples:
+    TelemetryBatchExample:
+      summary: Смешанный батч (EV-погрузчик с перегревом)
+      value:
+        vehicle_id: FRK-014
+        device_id: TBU-000771
+        sent_at: "2026-06-30T10:14:05Z"
+        seq: 84213
+        metrics:
+          - { sensor: "gps.location", ts: "2026-06-30T10:14:03Z", value: { lat: 55.751, lon: 37.618, speed: 0, heading: 0, sats: 11, hdop: 0.8 } }
+          - { sensor: "battery.soc",  ts: "2026-06-30T10:14:03Z", value: 47, unit: "%", q: 1 }
+          - { sensor: "battery.temp", ts: "2026-06-30T10:14:03Z", value: 61, unit: "°C", q: 1 }
+          - { sensor: "battery.voltage", ts: "2026-06-30T10:14:03Z", value: 79.4, unit: "V", q: 1 }
+          - { sensor: "motor.temp", ts: "2026-06-30T10:14:03Z", value: 52, unit: "°C", q: 1 }
+          - { sensor: "lift.load_weight", ts: "2026-06-30T10:14:03Z", value: 0, unit: "kg", q: 1 }
